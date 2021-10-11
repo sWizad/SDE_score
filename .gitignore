@@ -7,6 +7,8 @@ tools/__pycache__/
 logs/
 logs*/
 data/
+MNIST/
+checkpoints/
 configs2/
 scratch/
 experiment_config/
@@ -24,6 +26,7 @@ command.sh
 _TO_install
 _TO_install2
 plot_test.py
+ckpt.pth
 
 # C extensions
 *.so
