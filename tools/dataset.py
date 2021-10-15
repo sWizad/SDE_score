@@ -5,7 +5,7 @@ from random import random
 
 from PIL import Image
 from pathlib import Path
-#from tools.helper import *
+from tools.helper import *
 
 EXTS = ['jpg', 'jpeg', 'png']
 # dataset
@@ -55,8 +55,13 @@ class Dataset(data.Dataset):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
-        self.paths = [p for ext in EXTS for p in Path(f'{folder}').glob(f'**/*.{ext}')]
-
+        if isinstance(folder, list):
+            self.paths = []
+            for ff in folder:
+                self.paths = self.paths + [p for ext in EXTS for p in Path(f'{ff}').glob(f'**/*.{ext}')]
+        else:
+            self.paths = [p for ext in EXTS for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        
         convert_image_fn = convert_transparent_to_rgb if not transparent else convert_rgb_to_transparent
         num_channels = 3 if not transparent else 4
 
@@ -64,6 +69,8 @@ class Dataset(data.Dataset):
             transforms.Lambda(convert_image_fn),
             transforms.Lambda(partial(resize_to_minimum_size, image_size)),
             transforms.Resize(image_size),
+            transforms.RandomHorizontalFlip(p=0.2),
+            #transforms.RandomAffine(degrees=0, translate=(0.1,0.1),fill=255),
             RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(image_size)),
             transforms.ToTensor(),
             transforms.Lambda(expand_greyscale(transparent))

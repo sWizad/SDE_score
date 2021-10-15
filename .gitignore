@@ -9,13 +9,8 @@ logs*/
 data/
 MNIST/
 checkpoints/
-configs2/
-scratch/
-experiment_config/
-experiment_batch/
-configs/bedroom/
-configs/diet/
-task_dev/
+stylegan2/__pycache__/
+stylegan2/op/__pycache__/
 recycle_bin/
 /*.jpg
 /*.png

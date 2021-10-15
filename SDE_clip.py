@@ -1,6 +1,3 @@
-'''
-This is simple SDE(diffusion model) training.
-'''
 import os
 import torch
 import torch.nn as nn
@@ -20,6 +17,7 @@ from tools.utils import *
 from tools.network import *
 
 from tensorboardX import SummaryWriter
+import clip
 
 
 device = 'cuda' #@param ['cuda', 'cpu'] {'type':'string'}
@@ -54,7 +52,12 @@ sigma =  25.0#@param {'type':'number'}
 marginal_prob_std_fn = functools.partial(marginal_prob_std, sigma=sigma)
 diffusion_coeff_fn = functools.partial(diffusion_coeff, sigma=sigma)
 
-def loss_fn(model, x, marginal_prob_std, eps=1e-5):
+normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                  std=[0.26862954, 0.26130258, 0.27577711])
+
+cutout = MyCutouts(cut_size)
+
+def loss_fn(model, x, token, marginal_prob_std, eps=1e-5):
   """The loss function for training score-based generative models.
 
   Args:
@@ -69,12 +72,35 @@ def loss_fn(model, x, marginal_prob_std, eps=1e-5):
   z = torch.randn_like(x)
   std = marginal_prob_std(random_t)
   perturbed_x = x + z * std[:, None, None, None]
-  score = model(perturbed_x, random_t)
+  score = model(perturbed_x, random_t, token=token)
   loss = torch.mean(torch.sum((score * std[:, None, None, None] + z)**2, dim=(1,2,3)))
+  return loss
+
+def loss_fn2(model, x, token, marginal_prob_std, eps=1e-5):
+  """The loss function for training score-based generative models.
+
+  Args:
+    model: A PyTorch model instance that represents a 
+      time-dependent score-based model.
+    x: A mini-batch of training data.    
+    marginal_prob_std: A function that gives the standard deviation of 
+      the perturbation kernel.
+    eps: A tolerance value for numerical stability.
+  """
+  random_t = torch.rand(x.shape[0], device=x.device) * (1. - eps) + eps  
+  z = torch.randn_like(x)
+  std = marginal_prob_std(random_t)
+  perturbed_x = x + z * std[:, None, None, None]
+  score = model(perturbed_x, random_t, token=token)
+  loss = torch.mean(torch.sum((score * std[:, None, None, None] + z)**2, dim=(1,2,3)))
+  xp = perturbed_x + score * std[:, None, None, None]**2
+  token1 = perceptor.encode_image(normalize(cutout(xp))).float()
+  loss1 = torch.mean(torch.sum((score * std[:, None, None, None] + z)**2, dim=(1,2,3)))
   return loss
 
 num_steps =  500#@param {'type':'integer'}
 def Euler_Maruyama_sampler(score_model, 
+                           token,
                            marginal_prob_std,
                            diffusion_coeff, 
                            batch_size=64, 
@@ -97,8 +123,9 @@ def Euler_Maruyama_sampler(score_model,
   Returns:
     Samples.    
   """
+  batch_size = token.shape[0]
   t = torch.ones(batch_size, device=device)
-  init_x = torch.randn(batch_size, 3, 80, 80, device=device) \
+  init_x = torch.randn(batch_size, 3, 96, 96, device=device) \
     * marginal_prob_std(t)[:, None, None, None]
   time_steps = torch.linspace(1., eps, num_steps, device=device)
   step_size = time_steps[0] - time_steps[1]
@@ -108,30 +135,37 @@ def Euler_Maruyama_sampler(score_model,
     for time_step in (time_steps):      
       batch_time_step = torch.ones(batch_size, device=device) * time_step
       g = diffusion_coeff(batch_time_step)
-      mean_x = x + (g**2)[:, None, None, None] * score_model(x, batch_time_step) * step_size
+      mean_x = x + (g**2)[:, None, None, None] * score_model(x, batch_time_step, token) * step_size
       x = mean_x + torch.sqrt(step_size) * g[:, None, None, None] * torch.randn_like(x)      
   # Do not include any noise in the last sampling step.
   return mean_x
 
 def main():
-    # TensorBoard
-    #logdir = cfg_data(cfg,['experiment', 'logdir'], 'logs')
 
     #score_model = torch.nn.DataParallel(ScoreNet(marginal_prob_std=marginal_prob_std_fn))
-    score_model = ResUNet(marginal_prob_std=marginal_prob_std_fn) #torch.nn.DataParallel(ResUNet())
+    score_model = ResUNet2(marginal_prob_std=marginal_prob_std_fn, is_token=True) #torch.nn.DataParallel(ResUNet())
     score_model = score_model.to(device)
 
-    id_name = 'pksp_aug'
+    jit = True if float(torch.__version__[:3]) < 1.8 else False
+    perceptor = clip.load("ViT-B/32", jit=jit)[0].eval().requires_grad_(False).to(device)
+    cut_size = perceptor.visual.input_resolution
+
+    id_name = 'pksp/clip_inv'
     n_epochs =   1000#@param {'type':'integer'}
     ## size of a mini-batch
-    batch_size =  64 #@param {'type':'integer'}
+    batch_size =  16 #@param {'type':'integer'}
     ## learning rate
     lr=1e-4 #@param {'type':'number'}
     sample_batch_size = 25
-    data_dir = '/data/pixelart/dragonflycave/gen4/Front'
-    image_size = 80
+    data_dir = ['/data/pixelart/gif_ext/front'
+                #'/data/pixelart/dragonflycave/gen4/Front',
+                #'/data/pixelart/trainer',
+                #'/data/pixelart/dragonflycave/fusion',
+                ]
+    image_size = 96
     num_workers = 4
 
+    # TensorBoard
     writerpath = os.path.join('logs/summaries', id_name)
     if os.path.exists(writerpath):
         os.system("rm -rf "+writerpath)
@@ -151,7 +185,8 @@ def main():
         for x in data_loader:
         #for x, y in data_loader:
             x = x.to(device)    
-            loss = loss_fn(score_model, x, marginal_prob_std_fn)
+            token = perceptor.encode_image(normalize(cutout(x))).float()
+            loss = loss_fn(score_model, x, token, marginal_prob_std_fn)
             optimizer.zero_grad()
             loss.backward()    
             optimizer.step()
@@ -160,17 +195,18 @@ def main():
 
         # Update tensorboard.
         if epoch % 1 == 0:
-            writer.add_scalar('Average Loss', avg_loss/num_items , epoch)
             samples = Euler_Maruyama_sampler(score_model, 
+                                                token,
                                                 marginal_prob_std_fn,
                                                 diffusion_coeff_fn, 
                                                 sample_batch_size, 
                                                 device=device)
             samples = samples.clamp(0.0, 1.0)
-            sample_grid = make_grid(samples, nrow=int(np.sqrt(sample_batch_size)))
+            sample_grid = make_grid(samples, nrow=int(np.sqrt(batch_size)))
             writer.add_image("Euler sampler",sample_grid,epoch)
             x = make_grid(x, nrow=8)
             writer.add_image("True image",x, epoch)
+            writer.add_scalar('Average Loss', avg_loss/num_items , epoch)
 
         # Update the checkpoint after each epoch of training
         if epoch % 1 ==0:
