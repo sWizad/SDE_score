@@ -69,7 +69,7 @@ class Dataset(data.Dataset):
             transforms.Lambda(convert_image_fn),
             transforms.Lambda(partial(resize_to_minimum_size, image_size)),
             transforms.Resize(image_size),
-            transforms.RandomHorizontalFlip(p=0.2),
+            #transforms.RandomHorizontalFlip(p=0.2),
             #transforms.RandomAffine(degrees=0, translate=(0.1,0.1),fill=255),
             RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(image_size)),
             transforms.ToTensor(),

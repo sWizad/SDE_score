@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 from torchvision.datasets import MNIST
 from torchvision.utils import make_grid
+import torchvision.datasets as ds
 #import tqdm
 from tqdm.auto import tqdm
 from tools.dataset import *
@@ -56,7 +57,7 @@ normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                   std=[0.26862954, 0.26130258, 0.27577711])
 
 
-num_steps =  500#@param {'type':'integer'}
+num_steps =  250#@param {'type':'integer'}
 def Euler_Maruyama_sampler(score_model, 
                            token,
                            marginal_prob_std,
@@ -83,18 +84,21 @@ def Euler_Maruyama_sampler(score_model,
   """
   batch_size = token.shape[0]
   t = torch.ones(batch_size, device=device)
-  init_x = torch.randn(batch_size, 3, 80, 80, device=device) \
+  init_x = torch.randn(batch_size, 3, 96, 96, device=device) \
     * marginal_prob_std(t)[:, None, None, None]
   time_steps = torch.linspace(1., eps, num_steps, device=device)
   step_size = time_steps[0] - time_steps[1]
   x = init_x
   with torch.no_grad():
-    #for time_step in tqdm(time_steps):
-    for time_step in (time_steps):      
+    for time_step in tqdm(time_steps):
+    #for time_step in (time_steps):      
       batch_time_step = torch.ones(batch_size, device=device) * time_step
       g = diffusion_coeff(batch_time_step)
       mean_x = x + (g**2)[:, None, None, None] * score_model(x, batch_time_step, token) * step_size
-      x = mean_x + torch.sqrt(step_size) * g[:, None, None, None] * torch.randn_like(x)      
+      if time_step > time_steps[-10]:
+        x = mean_x + torch.sqrt(step_size) * g[:, None, None, None] * torch.randn_like(x)      
+      else:
+        x = mean_x
   # Do not include any noise in the last sampling step.
   return mean_x
 
@@ -156,42 +160,60 @@ def SDEdit(score_model, img, token, marginal_prob_std, diffusion_coeff, num_step
       return x
 
 def main():
-    score_model = ResUNet(marginal_prob_std=marginal_prob_std_fn, is_token=True) #torch.nn.DataParallel(ResUNet())
+    score_model = ResUNet2(marginal_prob_std=marginal_prob_std_fn, is_token=True) #torch.nn.DataParallel(ResUNet())
     score_model = score_model.to(device)
 
+    '''
     jit = True if float(torch.__version__[:3]) < 1.8 else False
     perceptor = clip.load("ViT-B/32", jit=jit)[0].eval().requires_grad_(False).to(device)
     cut_size = perceptor.visual.input_resolution
     cutout = MyCutouts(cut_size)
+    '''
+    model, preprocess = clip.load('ViT-B/32', device)
 
-    id_name = 'pksp_clip3'
+    id_name = 'pksp/clip_inv'#'pksp_clip3'
     n_epochs =   1000#@param {'type':'integer'}
     ## size of a mini-batch
     batch_size =  64 #@param {'type':'integer'}
     ## learning rate
     lr=1e-4 #@param {'type':'number'}
     sample_batch_size = 16
-    data_dir = ['/data/pixelart/dragonflycave/gen4/Front',
-                #'/data/pixelart/trainer',
+    data_dir = [#'/data/pixelart/dragonflycave/gen4/Front',
+                #'/data/pixelart/gif_ext/front/normal/female',
+                '/data/pixelart/pksp/trainer',
+                #'/data/pixelart/dragonflycave/fusion',
                 #'/data/pixelart/dragonflycave/fusion',
                 ]
-    image_size = 80
+    image_size = 96
     num_workers = 4
-    prom_txt = 'little deer #pixelart'
+    prom_txt = 'ball #pixelart'
 
-    token0 = perceptor.encode_text(clip.tokenize(prom_txt).to(device)).float()
-    token0 = torch.repeat_interleave(token0,sample_batch_size,dim=0)
-
+    #token0 = perceptor.encode_text(clip.tokenize(prom_txt).to(device)).float()
+    #token0 = torch.repeat_interleave(token0,sample_batch_size,dim=0)
+    
     ckpt = torch.load(os.path.join('checkpoints', id_name+'.pth'), map_location=device)
     score_model.load_state_dict(ckpt)
     
     dataset = Dataset(data_dir, image_size, transparent = 0, aug_prob = 0.)
     data_loader = DataLoader(dataset, num_workers = num_workers, batch_size = sample_batch_size, drop_last = True, shuffle=True, pin_memory=True)
-    x = next(iter(data_loader))
-    x = x.to(device)    
+    #load dataset
+    #dataset = ds.CIFAR10('/data/torchvision_dataset', train=False, download=True)
+    #data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    #p, b = dataset[123]
+    #x, y = next(iter(data_loader))
+    #cutout2 = MyCutouts(112)
+    #x = x.to(device)    
+    #print(x.shape)
+    #tt = preprocess(p)
+    #print(tt.shape)
+    #y = normalize(cutout2(x))
+    #print(y.shape)
+    #tt = perceptor.encode_image(y)
+    #print(tt.shape)
+    exit()
     token = perceptor.encode_image(normalize(cutout(x))).float()
     
-    token = token#token0
+    token = token #token0
     #token = token/torch.norm(token,dim=-1,keepdim=True)
     '''
     samples = SDEdit(score_model, x, 

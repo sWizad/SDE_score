@@ -9,6 +9,7 @@ import numpy as np
 
 import functools
 from torch.optim import Adam
+import tensorflow_datasets as tfds
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 from torchvision.datasets import MNIST

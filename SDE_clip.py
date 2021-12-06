@@ -8,7 +8,8 @@ import functools
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
-from torchvision.datasets import MNIST
+#from torchvision.datasets import MNIST
+import torchvision.datasets as ds
 from torchvision.utils import make_grid
 #import tqdm
 from tqdm.auto import tqdm
@@ -55,6 +56,9 @@ diffusion_coeff_fn = functools.partial(diffusion_coeff, sigma=sigma)
 normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                   std=[0.26862954, 0.26130258, 0.27577711])
 
+jit = True if float(torch.__version__[:3]) < 1.8 else False
+perceptor = clip.load("ViT-B/32", jit=jit)[0].eval().requires_grad_(False).to(device)
+cut_size = perceptor.visual.input_resolution
 cutout = MyCutouts(cut_size)
 
 def loss_fn(model, x, token, marginal_prob_std, eps=1e-5):
@@ -95,7 +99,8 @@ def loss_fn2(model, x, token, marginal_prob_std, eps=1e-5):
   loss = torch.mean(torch.sum((score * std[:, None, None, None] + z)**2, dim=(1,2,3)))
   xp = perturbed_x + score * std[:, None, None, None]**2
   token1 = perceptor.encode_image(normalize(cutout(xp))).float()
-  loss1 = torch.mean(torch.sum((score * std[:, None, None, None] + z)**2, dim=(1,2,3)))
+  dists = spherical_dist_loss(token, token1)
+  loss = [torch.mean(dists), loss]
   return loss
 
 num_steps =  500#@param {'type':'integer'}
@@ -123,9 +128,10 @@ def Euler_Maruyama_sampler(score_model,
   Returns:
     Samples.    
   """
+  global image_size
   batch_size = token.shape[0]
   t = torch.ones(batch_size, device=device)
-  init_x = torch.randn(batch_size, 3, 96, 96, device=device) \
+  init_x = torch.randn(batch_size, 3, image_size, image_size, device=device) \
     * marginal_prob_std(t)[:, None, None, None]
   time_steps = torch.linspace(1., eps, num_steps, device=device)
   step_size = time_steps[0] - time_steps[1]
@@ -141,76 +147,91 @@ def Euler_Maruyama_sampler(score_model,
   return mean_x
 
 def main():
-
+    global image_size
     #score_model = torch.nn.DataParallel(ScoreNet(marginal_prob_std=marginal_prob_std_fn))
-    score_model = ResUNet2(marginal_prob_std=marginal_prob_std_fn, is_token=True) #torch.nn.DataParallel(ResUNet())
+    score_model = ResUNet(marginal_prob_std=marginal_prob_std_fn, is_token=True) #torch.nn.DataParallel(ResUNet())
     score_model = score_model.to(device)
 
-    jit = True if float(torch.__version__[:3]) < 1.8 else False
-    perceptor = clip.load("ViT-B/32", jit=jit)[0].eval().requires_grad_(False).to(device)
-    cut_size = perceptor.visual.input_resolution
 
-    id_name = 'pksp/clip_inv'
+    id_name = 'clip_inv'
+    model_dir = 'cifar'
     n_epochs =   1000#@param {'type':'integer'}
     ## size of a mini-batch
-    batch_size =  16 #@param {'type':'integer'}
+    batch_size =  96 #@param {'type':'integer'}
     ## learning rate
     lr=1e-4 #@param {'type':'number'}
     sample_batch_size = 25
-    data_dir = ['/data/pixelart/gif_ext/front'
+    data_dir = [#'/data/pixelart/gif_ext/front/normal/female',
+                '/data/pixelart/gif_ext/front',
                 #'/data/pixelart/dragonflycave/gen4/Front',
-                #'/data/pixelart/trainer',
+                '/data/pixelart/pksp',
                 #'/data/pixelart/dragonflycave/fusion',
                 ]
-    image_size = 96
+    image_size = 32
     num_workers = 4
 
     # TensorBoard
-    writerpath = os.path.join('logs/summaries', id_name)
+    writerpath = os.path.join('logs/summaries',model_dir, id_name)
     if os.path.exists(writerpath):
         os.system("rm -rf "+writerpath)
     writer = SummaryWriter(writerpath)
+    os.makedirs(os.path.join('checkpoints', model_dir),exist_ok=True)
 
-    dataset = Dataset(data_dir, image_size, transparent = 0, aug_prob = 0.)
-    data_loader = DataLoader(dataset, num_workers = num_workers, batch_size = batch_size, drop_last = True, shuffle=True, pin_memory=True)
+    #dataset = Dataset(data_dir, image_size, transparent = 0, aug_prob = 0.)
+    #data_loader = DataLoader(dataset, num_workers = num_workers, batch_size = batch_size, drop_last = True, shuffle=True, pin_memory=True)
     #dataset = MNIST('.', train=True, transform=transforms.ToTensor(), download=True)
     #data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    dataset = ds.CIFAR100('/data/torchvision_dataset', train=True, transform=transforms.ToTensor(), download=True)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
 
     optimizer = Adam(score_model.parameters(), lr=lr)
 
     #tqdm_epoch = tqdm.notebook.trange(n_epochs)
-    for epoch in tqdm(range(n_epochs)): #tqdm_epoch:
-        avg_loss = 0.
+    #for epoch in tqdm(range(n_epochs)): #tqdm_epoch:
+    with tqdm(total=n_epochs, desc="It "+id_name) as progress_bar:
+      for epoch in range(n_epochs):
+        main_loss = 0.
+        pix_loss = 0.
         num_items = 0
-        for x in data_loader:
-        #for x, y in data_loader:
-            x = x.to(device)    
-            token = perceptor.encode_image(normalize(cutout(x))).float()
-            loss = loss_fn(score_model, x, token, marginal_prob_std_fn)
-            optimizer.zero_grad()
-            loss.backward()    
-            optimizer.step()
-            avg_loss += loss.item() * x.shape[0]
-            num_items += x.shape[0]
+        #for x in data_loader:
+        for x, _ in data_loader:
+          x = x.to(device)  
+          token = perceptor.encode_image(normalize(cutout(x))).float()
+          loss = loss_fn2(score_model, x, token, marginal_prob_std_fn)
+          all_loss = 20000 * loss[0] + loss[1] 
+          optimizer.zero_grad()
+          all_loss.backward()    
+          optimizer.step()
+          main_loss += 20000 * loss[0].item() * x.shape[0]
+          pix_loss += loss[1].item() * x.shape[0]
+          num_items += x.shape[0]
 
         # Update tensorboard.
         if epoch % 1 == 0:
-            samples = Euler_Maruyama_sampler(score_model, 
-                                                token,
-                                                marginal_prob_std_fn,
-                                                diffusion_coeff_fn, 
-                                                sample_batch_size, 
-                                                device=device)
-            samples = samples.clamp(0.0, 1.0)
-            sample_grid = make_grid(samples, nrow=int(np.sqrt(batch_size)))
-            writer.add_image("Euler sampler",sample_grid,epoch)
-            x = make_grid(x, nrow=8)
-            writer.add_image("True image",x, epoch)
-            writer.add_scalar('Average Loss', avg_loss/num_items , epoch)
+        #if num_items % 1024*32 == 0:
+          writer.add_scalar('Main Loss', main_loss/num_items , epoch)
+          writer.add_scalar('Pixel Loss', pix_loss/num_items , epoch)
+        if epoch % 1 == 0:
+        #if num_items % 1024*32 == 0:
+          token = token[:sample_batch_size]
+          x = x[:sample_batch_size]
+          samples = Euler_Maruyama_sampler(score_model, 
+                                              token,
+                                              marginal_prob_std_fn,
+                                              diffusion_coeff_fn, 
+                                              sample_batch_size, 
+                                              device=device)
+          samples = samples.clamp(0.0, 1.0)
+          sample_grid = make_grid(samples, nrow=int(np.sqrt(sample_batch_size)))
+          writer.add_image("Euler sampler",sample_grid,epoch)
+          x = make_grid(x, nrow=int(np.sqrt(sample_batch_size)))
+          writer.add_image("True image",x, epoch)
 
         # Update the checkpoint after each epoch of training
         if epoch % 1 ==0:
-            torch.save(score_model.state_dict(), os.path.join('checkpoints', id_name+'.pth') )
+            torch.save(score_model.state_dict(), os.path.join('checkpoints', model_dir, id_name+'.pth') )
+        progress_bar.update(1)
 
 if __name__ == "__main__":
     sys.excepthook = colored_hook(os.path.dirname(os.path.realpath(__file__)))

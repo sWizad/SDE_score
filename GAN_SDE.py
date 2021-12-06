@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from argparse import Namespace
 
 from torchvision.utils import make_grid
 from torchvision.transforms import ToPILImage
@@ -39,10 +40,11 @@ with torch.no_grad():
 
     plt.imshow(image, vmin=0., vmax=1.)
     plt.savefig('res.png')
-    print(latent_code_init.shape)
-    print(torch.sum((latent_code_init[:,0]-latent_code_init[:,1])**2))
+    #print(latent_code_init.shape)
+    #print(torch.sum((latent_code_init[:,0]-latent_code_init[:,1])**2))
     #img_orig2, latent_code_init = g_ema([latent_code_init_not_trunc], return_latents=True,
     #                            truncation=0.7, truncation_latent=mean_latent)
+    latent_code_init[:,5:10] = latent_code_init[:,5:10] + torch.randn_like(latent_code_init[:,5:10])
 
     img_orig2, _ = g_ema([latent_code_init], input_is_latent=True, randomize_noise=False)
     image = ToPILImage()(make_grid(img_orig2.detach().cpu(), normalize=True, scale_each=True, range=(-1, 1), padding=0))
@@ -84,10 +86,8 @@ def diffusion_coeff(t, sigma):
 sigma =  25.0#@param {'type':'number'}
 marginal_prob_std_fn = functools.partial(marginal_prob_std, sigma=sigma)
 diffusion_coeff_fn = functools.partial(diffusion_coeff, sigma=sigma)
-normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                  std=[0.26862954, 0.26130258, 0.27577711])
 
-def loss_fn(model, x, token, marginal_prob_std, eps=1e-5):
+def loss_fn(model, img, x, marginal_prob_std, eps=1e-5):
   """The loss function for training score-based generative models.
 
   Args:
@@ -98,12 +98,14 @@ def loss_fn(model, x, token, marginal_prob_std, eps=1e-5):
       the perturbation kernel.
     eps: A tolerance value for numerical stability.
   """
+  x = x[:,:5]
   random_t = torch.rand(x.shape[0], device=x.device) * (1. - eps) + eps  
   z = torch.randn_like(x)
   std = marginal_prob_std(random_t)
-  perturbed_x = x + z * std[:, None]
-  score = model(perturbed_x, random_t, token)
-  loss = torch.mean(torch.sum((score * std[:, None] + z)**2, dim=1))
+  perturbed_x = x + z * std[:, None, None]
+  score = model( perturbed_x, img, random_t)
+  loss = torch.mean(torch.sum((score * std[:, None, None] + z)**2, dim=1))
+  # add image loss
   return loss
 
 num_steps =  100#@param {'type':'integer'}
@@ -205,19 +207,30 @@ def main():
     g_ema.load_state_dict(torch.load('checkpoints/stylegan2-ffhq-config-f.pt')["g_ema"], strict=False)
     g_ema.eval()
     g_ema = g_ema.to(device)
-
+    """
     jit = True if float(torch.__version__[:3]) < 1.8 else False
     perceptor = clip.load("ViT-B/32", jit=jit)[0].eval().requires_grad_(False).to(device)
     cut_size = perceptor.visual.input_resolution
     cutout = MyCutouts(cut_size)
-
-    score_model = MyMLP(marginal_prob_std=marginal_prob_std_fn, is_token=True) #torch.nn.DataParallel(ResUNet())
+    """
+    #score_model = MyGANInv(marginal_prob_std=marginal_prob_std_fn, is_token=True) #torch.nn.DataParallel(ResUNet())
+    
+    model_path = '/home/suttisak/mnt_tl_Vision01/home2/suttisak/restyle-encoder/pretrained_models/restyle_psp_ffhq_encode.pt'
+    ckpt = torch.load(model_path, map_location='cpu')
+    opts = ckpt['opts']
+    print(opts)
+    # update the training options
+    opts['checkpoint_path'] = model_path
+    opts = Namespace(**opts)
+    net = pSp(opts)
+    exit()
+    score_model = pSp(marginal_prob_std=marginal_prob_std_fn)
     score_model = score_model.to(device)
 
-    id_name = 'stylegan'
-    model_dir = 'clipgan'
-    n_epochs =   10000
-    batch_size =  25 
+    id_name = 'stylegan5-10'
+    model_dir = 'invgan'
+    n_epochs =   1000
+    batch_size =  4
     sample_batch_size =  4 
     lr=1e-3
 
@@ -237,9 +250,8 @@ def main():
         with torch.no_grad():
             img_orig, latent_code_init = g_ema([latent_code_init_not_trunc], return_latents=True,
                                         truncation=0.7, truncation_latent=mean_latent)
-            token = perceptor.encode_image(normalize(cutout(img_orig))).float()
 
-        loss = loss_fn(score_model, latent_code_init_not_trunc, token, marginal_prob_std_fn)
+        loss = loss_fn(score_model, img_orig, latent_code_init, marginal_prob_std_fn)
         optimizer.zero_grad()
         loss.backward()    
         optimizer.step()

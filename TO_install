@@ -3,3 +3,5 @@ How to install
 pip install functools
 
 pip install -e ./CLIP
+
+pip install -q tfds-nightly tensorflow matplotlib

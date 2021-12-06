@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
+from torchvision.models.resnet import resnet34
 import numpy as np
+
+from stylegan2.model import EqualLinear
 
 class MyCutouts(nn.Module):
     def __init__(self, cut_size):
@@ -12,6 +16,10 @@ class MyCutouts(nn.Module):
         cutout = self.av_pool(input)
         return cutout
 
+def spherical_dist_loss(x, y):
+    x = F.normalize(x, dim=-1)
+    y = F.normalize(y, dim=-1)
+    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
 
 class ResidualBlock(nn.Module):
     def __init__(self, main, skip=None):
@@ -222,6 +230,42 @@ class ResUNet2(nn.Module):
         h = h / self.marginal_prob_std(t)[:, None, None, None] 
         return h
 
+class ResUNet3(nn.Module): #can't use now
+    def __init__(self, marginal_prob_std, embed_dim=256, is_token=False):
+        super().__init__()
+        c = 64  # The base channel count
+
+        # The inputs to timestep_embed will approximately fall into the range
+        # -10 to 10, so use std 0.2 for the Fourier Features.
+        #self.timestep_embed = FourierFeatures(1, 16, std=0.2)
+        # self.class_embed = nn.Embedding(10, 4)
+        self.embed = nn.Sequential(GaussianFourierProjection(embed_dim=embed_dim),
+            nn.Linear(embed_dim, c))
+        num_input = 3 + c
+        if is_token:
+            self.token_emb = nn.Sequential(
+                nn.Linear(512, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, c),
+                nn.ReLU(),
+                nn.Linear(c, c),
+            )
+            num_input = num_input +c
+      
+        """
+        """
+        # The swish activation function
+        self.act = lambda x: x * torch.sigmoid(x)
+        self.marginal_prob_std = marginal_prob_std
+        
+    def forward(self, x, t, token=None):
+        embed = expand_to_planes(self.act(self.embed(t)) , x.shape)
+        #tt = expand_to_planes(self.token_emb(token),  x.shape)
+        a = torch.cat([x, tt, embed],1)
+        h = self.net(torch.cat([x, tt, embed],1))
+        h = h / self.marginal_prob_std(t)[:, None, None, None] 
+        return h
+
 ## from Score base
 
 class GaussianFourierProjection(nn.Module):
@@ -341,6 +385,101 @@ class ScoreNet(nn.Module):
     h = h / self.marginal_prob_std(t)[:, None, None, None]
     return h
 
+## from pSp
+class GradualStyleBlock(nn.Module):
+    def __init__(self, in_c, out_c, spatial):
+        super(GradualStyleBlock, self).__init__()
+        self.out_c = out_c
+        self.spatial = spatial
+        num_pools = int(np.log2(spatial))
+        modules = []
+        modules += [nn.Conv2d(in_c, out_c, kernel_size=3, stride=2, padding=1),
+                    nn.LeakyReLU()]
+        for i in range(num_pools - 1):
+            modules += [
+                nn.Conv2d(out_c, out_c, kernel_size=3, stride=2, padding=1),
+                nn.LeakyReLU()
+            ]
+        self.convs = nn.Sequential(*modules)
+        self.linear = EqualLinear(out_c, out_c, lr_mul=1)
+
+    def forward(self, img, x):
+        img = self.convs(img)
+        img = img.view(-1, self.out_c)
+        # Add concat
+        x = self.linear(x)
+        return x
+
+class ResNetBackboneEncoder(nn.Module):
+    """
+    The simpler backbone architecture used by ReStyle where all style vectors are extracted from the final 16x16 feature
+    map of the encoder. This classes uses the simplified architecture applied over an ResNet34 backbone.
+    """
+    def __init__(self, n_styles=18, opts=None, input_nc = 3):
+        super(ResNetBackboneEncoder, self).__init__()
+
+        self.conv1 = nn.Conv2d(input_nc, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.PReLU(64)
+
+        resnet_basenet = resnet34(pretrained=True)
+        blocks = [
+            resnet_basenet.layer1,
+            resnet_basenet.layer2,
+            resnet_basenet.layer3,
+            resnet_basenet.layer4
+        ]
+        modules = []
+        for block in blocks:
+            for bottleneck in block:
+                modules.append(bottleneck)
+        self.body = nn.Sequential(*modules)
+        
+        self.styles = nn.ModuleList()
+        self.style_count = n_styles
+        for i in range(self.style_count):
+            style = GradualStyleBlock(512, 512, 16)
+            self.styles.append(style)
+        
+
+    def forward(self, img, x):
+        out = self.conv1(img)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.body(out)
+        
+        latents = []
+        for j in range(self.style_count):
+            latents.append(self.styles[j](out, x))
+        out = torch.stack(latents, dim=1)
+        
+        return out
+
+class pSp(nn.Module):
+    def __init__(self, marginal_prob_std, embed_dim=256):
+        super(pSp, self).__init__()
+        c = 64
+        self.encoder = ResNetBackboneEncoder(5, input_nc = 3+c)
+        self.embed = nn.Sequential(GaussianFourierProjection(embed_dim=embed_dim),
+            nn.Linear(embed_dim, c))
+        self.embed2 = nn.Sequential(GaussianFourierProjection(embed_dim=embed_dim),
+            nn.Linear(embed_dim, c))
+
+        # The swish activation function
+        self.act = lambda x: x * torch.sigmoid(x)
+        self.down = Downsample2d()
+        self.marginal_prob_std = marginal_prob_std
+
+    def forward(self, x, img, t,):
+        img = self.down(self.down(img)) #add current img
+        embed = expand_to_planes(self.act(self.embed(t)) , img.shape)
+        h = self.encoder(torch.cat([img, embed],1), x)
+        print(h.shape)
+        exit()
+        h = h / self.marginal_prob_std(t)[:, None,] 
+        return h
+
+
 ## My design
 class MyMLP(nn.Module):
     def __init__(self, marginal_prob_std, embed_dim=256, is_token=False):
@@ -376,5 +515,50 @@ class MyMLP(nn.Module):
     def forward(self, x, t, token=None):
         embed = self.act(self.embed(t))
         h = self.net(torch.cat([x, token, embed],1))
+        h = h / self.marginal_prob_std(t)[:, None,] 
+        return h
+
+
+class MyGANInv(nn.Module):
+    def __init__(self, marginal_prob_std, embed_dim=256, is_token=False):
+        super().__init__()
+        c = 64  # The base channel count
+
+        # The inputs to timestep_embed will approximately fall into the range
+        # -10 to 10, so use std 0.2 for the Fourier Features.
+        #self.timestep_embed = FourierFeatures(1, 16, std=0.2)
+        # self.class_embed = nn.Embedding(10, 4)
+        self.embed = nn.Sequential(GaussianFourierProjection(embed_dim=embed_dim),
+            nn.Linear(embed_dim, c))
+        num_input = 3 + c
+
+        self.net = nn.Sequential(
+            ResConvBlock(num_input, c, c),
+            Downsample2d(),
+            ResConvBlock(c, c * 2, c * 2),
+            ResConvBlock(c * 2, c * 2, c * 2),
+            Downsample2d(),
+            ResConvBlock(c * 2, c * 2, c * 2),
+            ResConvBlock(c * 2, c * 2, c * 2),
+            Downsample2d(),
+            ResConvBlock(c * 2, c * 2, c * 2),
+            ResConvBlock(c * 2, c * 2, c * 2),
+        )
+        # The swish activation function
+        self.act = lambda x: x * torch.sigmoid(x)
+        self.marginal_prob_std = marginal_prob_std
+        
+    def forward(self, img, x, t,):
+        embed = expand_to_planes(self.act(self.embed(t)) , img.shape)
+        #print(img.shape)
+        #print(embed.shape)
+        h = self.net(torch.cat([img, embed],1))
+        # add avg pooling
+        #embed2 = self.act(self.embed2(t))
+        #embed2 = torch.reshape(embed2,(-1,18,64))
+        # add concat
+        # run final MLP
+        print("h", h.shape)
+        exit()
         h = h / self.marginal_prob_std(t)[:, None,] 
         return h
